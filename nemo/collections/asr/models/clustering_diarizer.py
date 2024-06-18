@@ -395,7 +395,7 @@ class ClusteringDiarizer(torch.nn.Module, Model, DiarizationMixin):
                 entry = {'audio_filepath': audio_file, 'offset': 0.0, 'duration': None, 'text': '-', 'label': 'infer'}
                 fp.write(json.dumps(entry) + '\n')
 
-    def diarize(self, paths2audio_files: List[str] = None, batch_size: int = 0):
+    def diarize(self, paths2audio_files: List[str] = None, batch_size: int = 0, return_hypothesis: bool = False):
         """
         Diarize files provided thorugh paths2audio_files or manifest file
         input:
@@ -463,6 +463,8 @@ class ClusteringDiarizer(torch.nn.Module, Model, DiarizationMixin):
         )
         logging.info("Outputs are saved in {} directory".format(os.path.abspath(self._diarizer_params.out_dir)))
 
+        if return_hypothesis:
+            return all_hypothesis
         # Scoring
         return score_labels(
             self.AUDIO_RTTM_MAP,

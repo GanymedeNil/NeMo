@@ -28,6 +28,7 @@ from pyannote.core import Annotation, Segment
 from tqdm import tqdm
 
 from nemo.collections.asr.data.audio_to_label import repeat_signal
+from nemo.collections.asr.parts.utils.longform_clustering import LongFormSpeakerClustering
 from nemo.collections.asr.parts.utils.offline_clustering import SpeakerClustering, get_argmin_mat, split_input_data
 from nemo.utils import logging
 
@@ -464,7 +465,7 @@ def perform_clustering(
         logging.warning("cuda=False, using CPU for eigen decomposition. This might slow down the clustering process.")
         cuda = False
 
-    speaker_clustering = SpeakerClustering(cuda=cuda)
+    speaker_clustering = LongFormSpeakerClustering(cuda=cuda)
 
     # If True, export torch script module and save it to the base folder.
     if clustering_params.get('export_script_module', False):
@@ -492,6 +493,8 @@ def perform_clustering(
             max_num_speakers=int(clustering_params.max_num_speakers),
             max_rp_threshold=float(clustering_params.max_rp_threshold),
             sparse_search_volume=int(clustering_params.sparse_search_volume),
+            chunk_cluster_count=clustering_params.get('chunk_cluster_count', None),
+            embeddings_per_chunk=clustering_params.get('embeddings_per_chunk', None),
         )
 
         del uniq_embs_and_timestamps
@@ -1068,7 +1071,7 @@ def get_speech_labels_for_update(
 
 def get_new_cursor_for_update(frame_start: float, segment_range_ts: List[List[float]],) -> Tuple[float, int]:
     """
-    Function for updating a cursor online speaker diarization. 
+    Function for updating a cursor online speaker diarization.
     Remove the old segments that overlap with the new frame (self.frame_start)
     cursor_for_old_segments is set to the onset of the t_range popped lastly.
 

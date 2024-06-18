@@ -13,11 +13,13 @@
 # limitations under the License.
 import copy
 import itertools
+from collections import Counter
 from math import ceil
 from typing import Dict, List, Optional, Union
 
 import librosa
 import numpy as np
+import soundfile as sf
 import torch
 from hydra.utils import instantiate
 from omegaconf import DictConfig, OmegaConf, open_dict
@@ -50,8 +52,11 @@ class EncDecSpeakerLabelModel(ModelPT, ExportableEncDecModel):
     Model class creates training, validation methods for setting up data
     performing model forward pass.
     Expects config dict for
+
         * preprocessor
+
         * Jasper/Quartznet Encoder
+
         * Speaker Decoder
     """
 
@@ -336,7 +341,8 @@ class EncDecSpeakerLabelModel(ModelPT, ExportableEncDecModel):
     @typecheck()
     def forward(self, input_signal, input_signal_length):
         processed_signal, processed_signal_len = self.preprocessor(
-            input_signal=input_signal, length=input_signal_length,
+            input_signal=input_signal,
+            length=input_signal_length,
         )
 
         if self.spec_augmentation is not None and self.training:
@@ -444,7 +450,7 @@ class EncDecSpeakerLabelModel(ModelPT, ExportableEncDecModel):
             emb: speaker embeddings (Audio representations)
             logits: logits corresponding of final layer
         """
-        audio, sr = librosa.load(path2audio_file, sr=None)
+        audio, sr = sf.read(path2audio_file)
         target_sr = self._cfg.train_ds.get('sample_rate', 16000)
         if sr != target_sr:
             audio = librosa.core.resample(audio, orig_sr=sr, target_sr=target_sr)
@@ -452,7 +458,7 @@ class EncDecSpeakerLabelModel(ModelPT, ExportableEncDecModel):
         device = self.device
         audio = np.array([audio])
         audio_signal, audio_signal_len = (
-            torch.tensor(audio, device=device),
+            torch.tensor(audio, device=device, dtype=torch.float32),
             torch.tensor([audio_length], device=device),
         )
         mode = self.training
@@ -466,25 +472,104 @@ class EncDecSpeakerLabelModel(ModelPT, ExportableEncDecModel):
         del audio_signal, audio_signal_len
         return emb, logits
 
-    def get_label(self, path2audio_file):
+    @torch.no_grad()
+    def infer_segment(self, segment):
         """
-        Returns label of path2audio_file from classes the model was trained on.
         Args:
-            path2audio_file: path to audio wav file
+            segment: segment of audio file
 
         Returns:
-            label: label corresponding to the trained model
+            emb: speaker embeddings (Audio representations)
+            logits: logits corresponding of final layer
         """
-        _, logits = self.infer_file(path2audio_file=path2audio_file)
+        segment_length = segment.shape[0]
+
+        device = self.device
+        audio = np.array([segment])
+        audio_signal, audio_signal_len = (
+            torch.tensor(audio, device=device, dtype=torch.float32),
+            torch.tensor([segment_length], device=device),
+        )
+        mode = self.training
+        self.freeze()
+
+        logits, emb = self.forward(input_signal=audio_signal, input_signal_length=audio_signal_len)
+
+        self.train(mode=mode)
+        if mode is True:
+            self.unfreeze()
+        del audio_signal, audio_signal_len
+        return emb, logits
+
+    def get_label(
+        self,
+        path2audio_file: str,
+        segment_duration: float = np.inf,
+        num_segments: int = 1,
+        random_seed: int = None,
+    ):
+        """
+        Returns label of the audio file specified by path2audio_file, based on the classes the model was trained on.
+
+        Args:
+            path2audio_file (str): Path to the audio WAV file.
+            segment_duration (float): Maximum duration of the randomly sampled segment in seconds.
+            num_segments (int): Maximum number of segments of the file to use for majority voting.
+            random_seed (int): Seed for generating the starting position of the segment.
+
+        Returns:
+            label: Label corresponding to the trained model. If the labels are not saved in the model configuration,
+            returns the index of the label.
+        """
+        audio, sr = sf.read(path2audio_file)
+        target_sr = self._cfg.train_ds.get('sample_rate', 16000)
+        if sr != target_sr:
+            audio = librosa.core.resample(audio, orig_sr=sr, target_sr=target_sr)
+        audio_length = audio.shape[0]
+
+        audio_segment_samples = target_sr * segment_duration
+
+        segments_in_audio = int(audio_length / audio_segment_samples)
+
+        segment_starts = []
+        segment_ends = []
+
+        np.random.seed(random_seed)
+
+        if segments_in_audio <= 1:
+            segment_starts = [0]
+            segment_ends = [audio_length]
+        else:
+            if segments_in_audio > num_segments:
+                segments_in_audio = num_segments
+
+            long_segment_duration = int(audio_length / segments_in_audio)
+
+            for segment_no in range(segments_in_audio):
+                long_start_segment = long_segment_duration * segment_no
+                long_end_segment = long_segment_duration * (segment_no + 1)
+                segment_start = np.random.randint(long_start_segment, long_end_segment - audio_segment_samples)
+                segment_end = segment_start + audio_segment_samples
+                segment_starts.append(segment_start)
+                segment_ends.append(segment_end)
+
+        label_id_list = []
+        for segment_start, segment_end in zip(segment_starts, segment_ends):
+            audio_segement = audio[segment_start:segment_end]
+
+            _, logits = self.infer_segment(audio_segement)
+            label_id = logits.argmax(axis=1)
+            label_id_list.append(int(label_id[0]))
+
+        m_label_id = Counter(label_id_list).most_common(1)[0][0]
 
         trained_labels = self._cfg['train_ds'].get('labels', None)
         if trained_labels is not None:
             trained_labels = list(trained_labels)
-            label_id = logits.argmax(axis=1)
-            label = trained_labels[int(label_id[0])]
+            label = trained_labels[m_label_id]
         else:
             logging.info("labels are not saved to model, hence only outputting the label id index")
-            label = logits.argmax(axis=1)
+            label = m_label_id
 
         return label
 
@@ -569,7 +654,9 @@ class EncDecSpeakerLabelModel(ModelPT, ExportableEncDecModel):
         dataset = AudioToSpeechLabelDataset(manifest_filepath=manifest_filepath, labels=None, featurizer=featurizer)
 
         dataloader = torch.utils.data.DataLoader(
-            dataset=dataset, batch_size=batch_size, collate_fn=dataset.fixed_seq_collate_fn,
+            dataset=dataset,
+            batch_size=batch_size,
+            collate_fn=dataset.fixed_seq_collate_fn,
         )
 
         logits = []
